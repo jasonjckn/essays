@@ -1,10 +1,14 @@
-The objective of this document to describe an implementation of “persistent aggregate” stream operator which accepts as an input stream, a key for grouping on, a monoid that implements the aggregation, and a pluggable backend storage where the results of the aggregation are persisted. The operator implemented here has exactly once semantics. Here’s an pseudo code example of using the operator: 
-twitter-firehose-stream
-.flatmap( map-function =  { lambda(json) -> { for word in json.tweet_text.split_on_white_space
+Copyright 2014 Jason Jackson. All rights reserved. 
+
+The objective of this document to describe an implementation of “persistent aggregate” stream operator which accepts as an input stream, a key for grouping on, a monoid that implements the aggregation, and a pluggable backend storage where the results of the aggregation are persisted. The operator implemented here has exactly once semantics. Here’s an pseudo code example of using the operator:
+
+    twitter-firehose-stream
+      .flatmap( map-function =  { lambda(json) -> { for word in json.tweet_text.split_on_white_space
                                                                             yield Tuple(word, 1) },
-              tuple-output-fields = [“tweet_word”, “count"] )
-.groupBy( “word” )
-.persistentAggregate(twitter-firehose, Monoid { zero() = 0, plus(a,b) = a + b }, ManhattanStore()); 
+                tuple-output-fields = [“tweet_word”, “count"] )
+      .groupBy( “word” )
+      .persistentAggregate(twitter-firehose, Monoid { zero() = 0, plus(a,b) = a + b }, ManhattanStore());
+
 
 This is an extremely common streaming operator needed for the speed layer of summingbird jobs. Currently storm & summingbird do not compute this operation with exactly once semantics. Trident does implement this operator however it has a few synchronization points with zookeeper, kafka, and the persistent store, which means latency in any one of those 3 will add to batch latency. Additionally trident currently does one zk quorum operation per kafka partition per batch this reach zookeeper’s maximum write throughput with anywhere between 33-136 trident topologies depending on partition count and batch frequency.  Also the write load on manhattan is not uniform due to the commits to state being batched.
 
@@ -20,16 +24,59 @@ It’s important to understand here that a processor can continue to transition 
 
 Let’s look at how it’s produce a new snapshot to the persistent store. As you recall in the persistent store, we write both the state machine state ’s0', and it’s clock ‘c0', and the meaning of ‘c0’ is the state ‘s0’ is the result of having processed all the items in each kafka partition p0 that had a KafkaOffsetIndex < c0[p0]. So when streaming computation starts up it can begin reading input from each partition p0 kafka at c0[p0].kafkaOffset, since the state in the store has seen every input that has come before it. Now with a storm topology you’ll have a DAG that may be a couple layers deep with upstream bottlenecks and latencies such each downstream bolt may be processing the input that originated from each partition at differing rates, thus if we define “max_clock” (a vector of KafkaOffsetIndex) of a downstream bolt to be the KafkaOffsetIndex such that it has never seen input beyond this.  In other words max_clock is computed like so: 
 
-onNewInputTupleToBolt(Tuple input):
-        max_clock[input.OriginatingSourceKafkaPartition] 
-            = max(max_clock[input.OrigSourceKafkaPartition], input.OriginatingKafkaOffsetIndex) 
+    onNewInputTupleToBolt(Tuple input):
+            max_clock[input.OriginatingSourceKafkaPartition] 
+                = max(max_clock[input.OrigSourceKafkaPartition], input.OriginatingKafkaOffsetIndex) 
 
 
 We’ll also need min_clock a bit later, so i’ll define it here anyways:
 
-onNewInputTupleToBolt(Tuple input):
-        min_clock[input.OriginatingSourceKafkaPartition] 
-            = min(min_clock[input.OrigSourceKafkaPartition], input.OriginatingKafkaOffsetIndex)  
-
+    onNewInputTupleToBolt(Tuple input):
+            min_clock[input.OriginatingSourceKafkaPartition] 
+                = min(min_clock[input.OrigSourceKafkaPartition], input.OriginatingKafkaOffsetIndex)  
 
 Each bolt instance will not necessarily have the same clock at the same moment in time. We don’t want to synchronize them as this will add latency to the streaming computation, so instead we have a “Snapshot Negotiator” which asks each bolt for it’s max_clock, and then merges each max_clock with merge function ‘max’ such that resulting vector of KafkaOffsetIndex describes a position in input processing that none of the bolts have yet reached, we’ll call this “desired_clock_of_next_snapshot”. It then sends desired_clock_of_next_snapshot to each of the bolts asking them to take a snapshot at this clock value. At this point the bolts which have been transitioning their state machines on a single state, will maintain two states now A and B. The current state machine state will become “A", and “B" will be initialized to monoid zero(). All input to this bolt that comes from a position that is greater than or equal to desired_clock_of_next_snapshot is merged into B, and all input that is less than desired_clock_of_next_snapshot is merged into A. Finally once min_clock (defined above) exceeds desired_clock_of_next_snapshot  in every dimension. Then we know A will never be updated again with new input and we can begin persisting A and desired_clock_of_next_snapshot to storage. The “Snapshot Negotiator” helps us have each bolt instance persist the state from the same clock, thus the persisted state is consistent with respect to the input and exactly once semantics, every pieces of input is atomically processed — even if it was split by white space and a grouping was done causing the original input tuple to travel to multiple bolt instances, the persisted state will reflect atomic processing of the kafka items.
+
+    here's the basic algo
+
+    bolt_prepare() {
+       next_snapshot_clock = min_clock = max_clock = ManhattanStore().get_clock_of_last_snapshot().
+       (A, B) = (zero(), zero())
+    }
+
+    bolt_execute(Tuple tuple) {
+       low_water_mark := not defined here. 
+       atomic write max_clock[tuple.partition] = max(max_clock[tuple.partition], tuple.kafkaoffsetindex)
+       
+       
+       if(tuple.kafkaoffsetindex < low_water_mark) return; 
+       if(tuple.kafkaoffsetindex > next_snapshot_clock[partition]) {
+            B = plus(B, tuple)
+       } else {
+            A = plus(A, tuple)
+       }
+
+       if(low_water_mark > next_snapshot_clock) {
+           new Thread() { take_snapshot(next_snapshot_clock, A.clone() ) }
+           // clone could be optimized with persistent data structure. 
+           (A, B) =  (plus(A, B), zero())
+       }
+
+    take_snapshot(clock, A) {
+        ManhattanState = plus(ManhattanState, A)  // this operation could take a while, no problem. 
+    }
+
+    new Thread() {
+       // snapshot negotiator thread high priority . 
+
+      while true {
+          if (snapshot_in_progress) Sleep(100ms); 
+       
+           while(for every element e | max_clock[e] < negotiated_clock[e] ) {
+               negotiated_clock = do_negotiation(atomic read max_clock)
+           }
+
+           next_snapshot_clock = negotiated_clock
+       }
+    }
+
