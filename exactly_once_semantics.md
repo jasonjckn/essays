@@ -28,13 +28,6 @@ Let’s look at how it’s produce a new snapshot to the persistent store. As yo
             max_clock[input.OriginatingSourceKafkaPartition] 
                 = max(max_clock[input.OrigSourceKafkaPartition], input.OriginatingKafkaOffsetIndex) 
 
-
-We’ll also need min_clock a bit later, so i’ll define it here anyways:
-
-    onNewInputTupleToBolt(Tuple input):
-            min_clock[input.OriginatingSourceKafkaPartition] 
-                = min(min_clock[input.OrigSourceKafkaPartition], input.OriginatingKafkaOffsetIndex)  
-
 Each bolt instance will not necessarily have the same clock at the same moment in time. We don’t want to synchronize them as this will add latency to the streaming computation, so instead we have a “Snapshot Negotiator” which asks each bolt for it’s max_clock, and then merges each max_clock with merge function ‘max’ such that resulting vector of KafkaOffsetIndex describes a position in input processing that none of the bolts have yet reached, we’ll call this “desired_clock_of_next_snapshot”. It then sends desired_clock_of_next_snapshot to each of the bolts asking them to take a snapshot at this clock value. At this point the bolts which have been transitioning their state machines on a single state, will maintain two states now A and B. The current state machine state will become “A", and “B" will be initialized to monoid zero(). All input to this bolt that comes from a position that is greater than or equal to desired_clock_of_next_snapshot is merged into B, and all input that is less than desired_clock_of_next_snapshot is merged into A. Finally once min_clock (defined above) exceeds desired_clock_of_next_snapshot  in every dimension. Then we know A will never be updated again with new input and we can begin persisting A and desired_clock_of_next_snapshot to storage. The “Snapshot Negotiator” helps us have each bolt instance persist the state from the same clock, thus the persisted state is consistent with respect to the input and exactly once semantics, every pieces of input is atomically processed — even if it was split by white space and a grouping was done causing the original input tuple to travel to multiple bolt instances, the persisted state will reflect atomic processing of the kafka items.
 
     here's the basic algo
